@@ -1,0 +1,7 @@
+# Local inbox data, activity history and migration backups stay on this machine.
+/artifacts/
+*.sqlite
+*.sqlite-*
+node_modules/
+.env
+.env.*

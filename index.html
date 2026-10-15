@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>GitHub notification triage</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" type="module"></script>
+</head>
+<body>
+  <header>
+    <div><h1>A calmer inbox</h1></div>
+    <button id="refresh">Refresh GitHub</button>
+  </header>
+  <p id="status" role="status">Loading your inbox...</p>
+  <p id="error" role="alert" hidden></p>
+  <nav id="tabs" aria-label="Notification views"></nav>
+  <section class="filters" aria-label="Filters">
+    <input id="search" type="search" placeholder="Search titles, repositories, notes..." aria-label="Search">
+    <label><input id="group-by-repo" type="checkbox" checked>Group by repository</label>
+  </section>
+  <section class="toolbar">
+    <span id="summary"></span>
+    <button id="file-visible" hidden>Archive displayed updates</button>
+  </section>
+  <p id="explanation"></p>
+  <main id="items"></main>
+</body>
+</html>

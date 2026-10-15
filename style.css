@@ -1,0 +1,47 @@
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 24px; background: var(--background-color-default, #fff); color: var(--text-color-default, #1f2328); font-family: var(--font-sans, system-ui); font-size: var(--text-body-medium, 14px); line-height: 1.5; }
+header { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+h1 { font-size: 25px; margin: 0; letter-spacing: -.5px; }
+header p { margin-top: 3px; color: var(--text-color-muted, #656d76); }
+aside { padding: 12px; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 8px; color: var(--text-color-muted, #656d76); font-size: 12px; }
+button, input, select, textarea { font: inherit; color: inherit; border: 1px solid var(--border-color-default, #d0d7de); background: var(--background-color-default, #fff); border-radius: 6px; padding: 7px 10px; }
+button { cursor: pointer; }
+button:hover, button[aria-pressed=true] { background: var(--true-color-blue-muted, #ddf4ff); }
+button:disabled { opacity: .55; cursor: wait; }
+:focus-visible { outline: 2px solid var(--color-focus-outline, #0969da); outline-offset: 2px; }
+nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 18px 0; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; }
+#search { flex: 1; min-width: 180px; }
+.filters label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; align-items: center; margin: 18px 0 6px; }
+#explanation, #status, .meta, .empty { color: var(--text-color-muted, #656d76); font-size: 12px; }
+.why, .activity { margin: 6px 0; font-size: 12px; }
+.activity { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--text-color-muted, #656d76); }
+.activity-check { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 24px; height: 24px; padding: 3px; border: 0; background: transparent; color: inherit; }
+.activity-check svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+.activity-check[aria-busy=true] svg { animation: activity-refresh 1s linear infinite; }
+@keyframes activity-refresh { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .activity-check[aria-busy=true] svg { animation: none; } }
+#error { border: 1px solid var(--true-color-red, #cf222e); padding: 12px; border-radius: 6px; white-space: pre-wrap; }
+details { margin: 14px 0; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 8px; overflow: hidden; }
+summary { padding: 12px; cursor: pointer; font-weight: 600; }
+article { position: relative; border-top: 1px solid var(--border-color-default, #d0d7de); padding: 14px; }
+article > .history-button { position: absolute; top: 12px; right: 14px; padding: 4px 8px; font-size: 12px; }
+article > a { display: inline-block; max-width: calc(100% - 76px); }
+.ungrouped { margin: 14px 0; border: 1px solid var(--border-color-default, #d0d7de); border-radius: 8px; overflow: hidden; }
+.ungrouped article:first-child { border-top: 0; }
+article a { color: var(--true-color-blue, #0969da); font-weight: 600; text-decoration: none; overflow-wrap: anywhere; }
+article a:hover { text-decoration: underline; }
+.status-icon { width: 16px; height: 16px; margin-right: 6px; vertical-align: -3px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.status-icon--open { color: #1a7f37; }
+.status-icon--completed, .status-icon--merged { color: #8250df; }
+.status-icon--closed-pr { color: #cf222e; }
+.status-icon--closed-issue, .status-icon--not_planned, .status-icon--duplicate, .status-icon--draft, .status-icon--unknown { color: #656d76; }
+.meta { margin: 5px 0 10px; }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.actions button { font-size: 12px; padding: 4px 8px; }
+.activity-history { margin: 8px 0 0; padding-left: 20px; color: var(--text-color-muted, #656d76); font-size: 12px; }
+.note { display: flex; gap: 8px; margin-top: 10px; }
+.note input { min-width: 0; flex: 1; font-size: 12px; }
+[hidden] { display: none !important; }
