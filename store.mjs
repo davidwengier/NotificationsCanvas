@@ -6,10 +6,12 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { DatabaseSync } from "node:sqlite";
-import { needsAttention } from "./rules.mjs";
+import { bucket, classify, needsAttention, rulesVersion } from "./rules.mjs";
 
 const execute = promisify(execFile);
 const activityCacheVersion = 3;
+const notificationsEndpoint = "notifications?all=true&per_page=100";
+const bucketNames = { needs: "Needs me", following: "Following", followup: "Follow-up", snoozed: "Snoozed", filed: "Archived" };
 // Filter before taking the latest event so subscription and mention bookkeeping
 // cannot hide the discussion activity that caused the notification.
 const issueActivityTypes = [
@@ -73,13 +75,15 @@ function normalize(item) {
     const url = match
         ? `https://github.com/${match[1]}/${match[2] === "pulls" ? "pull" : "issues"}/${match[3]}`
         : item.repository?.html_url;
-    if (!item.id || !repo || !item.subject?.title || !Number.isFinite(Date.parse(item.updated_at)) ||
+    if (!item.id || !repo || !item.subject?.title || typeof item.reason !== "string" ||
+        typeof item.unread !== "boolean" || !Number.isFinite(Date.parse(item.updated_at)) ||
         !url?.startsWith("https://github.com/")) {
         throw new Error("GitHub returned an unsupported notification shape; the previous snapshot has not been replaced.");
     }
     return {
         id: String(item.id), repo, title: item.subject.title, number: match?.[3] ?? null, reason: item.reason,
-        type: item.subject.type, updatedAt: item.updated_at, url, inUnread: true,
+        type: item.subject.type, updatedAt: item.updated_at, url, inUnread: item.unread,
+        githubUnread: item.unread, githubReason: item.reason, inGithubNotifications: true,
     };
 }
 
@@ -111,7 +115,7 @@ export class TriageStore {
                     PRAGMA busy_timeout = 5000;
                 `);
                 const version = db.prepare("PRAGMA user_version").get().user_version;
-                if (version > 1) {
+                if (version > 2) {
                     db.close();
                     throw new Error(`Triage database schema ${version} is newer than this extension supports.`);
                 }
@@ -151,7 +155,25 @@ export class TriageStore {
                     );
                     CREATE INDEX IF NOT EXISTS activity_by_item
                         ON activity_log(account_id, item_id, occurred_at, sequence);
-                    PRAGMA user_version = 1;
+                    CREATE INDEX IF NOT EXISTS activity_by_thread
+                        ON activity_log(account_id, repo, number, sequence);
+                    CREATE TABLE IF NOT EXISTS refresh_runs (
+                        id TEXT PRIMARY KEY,
+                        account_id INTEGER,
+                        started_at TEXT NOT NULL,
+                        completed_at TEXT,
+                        status TEXT NOT NULL,
+                        stage TEXT NOT NULL,
+                        endpoint TEXT NOT NULL,
+                        page_count INTEGER,
+                        notification_count INTEGER,
+                        unread_count INTEGER,
+                        rules_version INTEGER NOT NULL,
+                        error TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS refresh_by_account
+                        ON refresh_runs(account_id, started_at);
+                    PRAGMA user_version = 2;
                 `);
                 return db;
             })();
@@ -255,6 +277,97 @@ export class TriageStore {
         });
     }
 
+    logDecision(state, item, previous, { trigger, refreshId = null, observedAt = new Date().toISOString() }) {
+        const decision = classify(item, Date.parse(observedAt));
+        const previousBucket = previous ? bucket(previous, Date.parse(observedAt)) : null;
+        const showInHistory = !previous || trigger !== "refresh" || previousBucket !== decision.bucket ||
+            previous.updatedAt !== item.updatedAt || previous.reason !== item.reason ||
+            previous.status !== item.status || previous.githubUnread !== item.githubUnread ||
+            previous.inGithubNotifications !== item.inGithubNotifications;
+        const readState = item.githubUnread === false ? " GitHub reported it as read." : "";
+        this.logActivity(state, item, {
+            eventType: "triage_decision",
+            source: "local_rule",
+            occurredAt: observedAt,
+            observedAt,
+            summary: `${bucketNames[decision.bucket]}: ${decision.explanation}${readState}`,
+            details: {
+                refreshId, trigger, rulesVersion, ...decision, previousBucket, showInHistory,
+                inputs: {
+                    reason: item.reason, githubReason: item.githubReason ?? null,
+                    githubUnread: item.githubUnread ?? null, returnedByGithub: item.inGithubNotifications ?? null,
+                    updatedAt: item.updatedAt, status: item.status ?? null, prState: item.prState ?? null,
+                    authorLogin: item.authorLogin ?? null, saved: item.saved ?? false,
+                    filed: item.filed ?? false, filedAt: item.filedAt ?? null,
+                    snoozedUntil: item.snoozedUntil ?? null, recentActivity: item.recentActivity ?? null,
+                    recentActivityOccurredAt: item.recentActivityOccurredAt ?? null,
+                },
+            },
+        });
+    }
+
+    saveRefreshRun(db, run) {
+        db.prepare(`
+            INSERT INTO refresh_runs
+                (id, account_id, started_at, completed_at, status, stage, endpoint,
+                 page_count, notification_count, unread_count, rules_version, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                account_id = excluded.account_id, completed_at = excluded.completed_at,
+                status = excluded.status, stage = excluded.stage, page_count = excluded.page_count,
+                notification_count = excluded.notification_count, unread_count = excluded.unread_count,
+                error = excluded.error
+        `).run(run.id, run.accountId ?? null, run.startedAt, run.completedAt ?? null,
+            run.status, run.stage, run.endpoint, run.pageCount ?? null, run.notificationCount ?? null,
+            run.unreadCount ?? null, rulesVersion, run.error ?? null);
+    }
+
+    async diagnose(repo, number, beforeSequence = null) {
+        if (typeof repo !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ||
+            !Number.isSafeInteger(Number(number)) || Number(number) < 1 ||
+            (beforeSequence !== null && (!Number.isSafeInteger(beforeSequence) || beforeSequence < 1))) {
+            throw new Error("A repository and a positive issue or PR number are required.");
+        }
+        const identity = this.identity ?? await this.account();
+        const state = await this.read(identity);
+        const db = await this.database();
+        const items = state.items.filter(item => item.repo === repo && item.number === String(number));
+        const rows = db.prepare(`
+            SELECT sequence, item_id AS itemId, event_type AS eventType, source, actor,
+                   occurred_at AS occurredAt, observed_at AS observedAt, summary, details_json AS detailsJson
+            FROM activity_log WHERE account_id = ? AND repo = ? AND number = ?
+                AND (? IS NULL OR sequence < ?)
+            ORDER BY sequence DESC LIMIT 201
+        `).all(identity.id, repo, String(number), beforeSequence, beforeSequence);
+        const events = rows.slice(0, 200).map(({ detailsJson, ...event }) => ({
+            ...event, details: detailsJson ? JSON.parse(detailsJson) : null,
+        }));
+        const runColumns = `
+            SELECT id, account_id AS accountId, started_at AS startedAt, completed_at AS completedAt,
+                   status, stage, endpoint, page_count AS pageCount, notification_count AS notificationCount,
+                   unread_count AS unreadCount, rules_version AS rulesVersion, error
+            FROM refresh_runs`;
+        const runs = db.prepare(`${runColumns} WHERE account_id = ? OR account_id IS NULL
+            ORDER BY started_at DESC, rowid DESC LIMIT 25
+        `).all(identity.id);
+        const refreshIds = [...new Set(events.map(event => event.details?.refreshId).filter(Boolean))];
+        const relatedRuns = refreshIds.length ? db.prepare(`${runColumns}
+            WHERE account_id = ? AND id IN (${refreshIds.map(() => "?").join(",")})
+            ORDER BY started_at DESC, rowid DESC
+        `).all(identity.id, ...refreshIds) : [];
+        const auditStartedAt = db.prepare(`
+            SELECT MIN(started_at) AS startedAt FROM refresh_runs WHERE account_id = ? OR account_id IS NULL
+        `).get(identity.id).startedAt;
+        return {
+            repo, number: String(number), rulesVersion,
+            items: items.map(({ note, ...item }) => ({ ...item, classification: classify(item) })),
+            events, recentRefreshes: runs, relatedRefreshes: relatedRuns, auditStartedAt,
+            hasMoreEvents: rows.length > 200,
+            nextBeforeSequence: rows.length > 200 ? events.at(-1).sequence : null,
+            coverage: "Polling only: a successful refresh records what GitHub returned, not proof it returned every event. Running attempts may have been interrupted. No history exists for gaps before auditing began.",
+        };
+    }
+
     async read(identity) {
         const db = await this.database();
         const state = this.loadState(db, identity);
@@ -275,6 +388,8 @@ export class TriageStore {
                    observed_at AS observedAt, summary, details_json AS detailsJson
             FROM activity_log
             WHERE account_id = ? AND item_id = ?
+                AND event_type NOT IN ('notification_observed', 'archive_attention_checked')
+                AND (event_type != 'triage_decision' OR json_extract(details_json, '$.showInHistory') = 1)
             ORDER BY occurred_at, sequence
         `).all(identity.id, id).map(event => ({
             ...event,
@@ -374,32 +489,118 @@ export class TriageStore {
     }
 
     async refresh() {
-        const identity = await this.account();
-        const pages = await this.client("notifications?per_page=100", true);
-        if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error("GitHub pagination returned an unexpected format.");
-        const unread = [...new Map(pages.flat().map(item => {
-            const normalized = normalize(item);
-            return [normalized.id, normalized];
-        })).values()];
+        const db = await this.database();
+        const run = {
+            id: randomUUID(), startedAt: new Date().toISOString(), status: "running",
+            stage: "account", endpoint: notificationsEndpoint,
+        };
+        this.saveRefreshRun(db, run);
+        try {
+            const identity = await this.account();
+            run.accountId = identity.id;
+            return await this.refreshSnapshot(identity, db, run);
+        } catch (error) {
+            run.status = "failed";
+            run.completedAt = new Date().toISOString();
+            run.error = error.message;
+            try {
+                this.saveRefreshRun(db, run);
+            } catch (auditError) {
+                throw new AggregateError([error, auditError], `Refresh failed: ${error.message}. Saving its diagnostic record also failed: ${auditError.message}`);
+            }
+            throw error;
+        }
+    }
+
+    async refreshSnapshot(identity, db, run) {
         const previousState = await this.read(identity);
-        const unreadIds = new Set(unread.map(item => item.id));
-        const retained = previousState.items.filter(item => !unreadIds.has(item.id));
+        run.stage = "notifications";
+        this.saveRefreshRun(db, run);
+        // Read flags belong to GitHub, not this inbox. Fetch read notifications too
+        // so another GitHub client cannot hide an update before our next poll.
+        const pages = await this.client(run.endpoint, true);
+        if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) throw new Error("GitHub pagination returned an unexpected format.");
+        run.stage = "normalization";
+        run.pageCount = pages.length;
+        run.notificationCount = pages.flat().length;
+        this.saveRefreshRun(db, run);
+        const notifications = new Map();
+        let normalizationError;
+        // Save minimal receipts before status/timeline lookups. Even a failed refresh
+        // must leave evidence that GitHub returned an item we could not apply.
+        await this.transaction(identity, state => {
+            for (const [index, raw] of pages.flat().entries()) {
+                const subjectUrl = typeof raw?.subject?.url === "string" ? raw.subject.url : "";
+                const match = /\/(?:issues|pulls)\/(\d+)$/.exec(subjectUrl);
+                const item = {
+                    id: typeof raw?.id === "string" || typeof raw?.id === "number" ? String(raw.id) : `invalid:${index}`,
+                    repo: typeof raw?.repository?.full_name === "string" ? raw.repository.full_name : "(unknown)",
+                    number: match?.[1] ?? null,
+                };
+                let error;
+                try {
+                    const normalized = normalize(raw ?? {});
+                    notifications.set(normalized.id, normalized);
+                } catch (failure) {
+                    error = failure;
+                    normalizationError ??= failure;
+                }
+                const observedAt = new Date().toISOString();
+                this.logActivity(state, item, {
+                    eventKey: `receipt:${run.id}:${index}`,
+                    eventType: error ? "notification_rejected" : "notification_observed",
+                    source: "github_observation",
+                    occurredAt: observedAt,
+                    observedAt,
+                    summary: error ? `GitHub returned an unsupported notification: ${error.message}` :
+                        `GitHub returned this notification (${raw.unread ? "unread" : "read"}).`,
+                    details: {
+                        refreshId: run.id, endpoint: run.endpoint,
+                        githubReason: typeof raw?.reason === "string" ? raw.reason : null,
+                        githubUnread: typeof raw?.unread === "boolean" ? raw.unread : null,
+                        updatedAt: typeof raw?.updated_at === "string" ? raw.updated_at : null,
+                        lastReadAt: typeof raw?.last_read_at === "string" ? raw.last_read_at : null,
+                    },
+                });
+            }
+        });
+        if (normalizationError) throw normalizationError;
+        const received = [...notifications.values()];
+        run.unreadCount = received.filter(item => item.inUnread).length;
+        const receivedIds = new Set(notifications.keys());
+        const retained = previousState.items.filter(item => !receivedIds.has(item.id));
         const previousItems = new Map(previousState.items.map(item => [item.id, item]));
-        const activityIds = new Set(unread
+        const activityIds = new Set(received
             .filter(item => ["Issue", "PullRequest"].includes(item.type) &&
                 (previousItems.get(item.id)?.activityUpdatedAt !== item.updatedAt ||
                     previousItems.get(item.id)?.activityVersion !== activityCacheVersion))
             .map(item => item.id));
-        const statuses = await this.loadStatuses([...unread, ...retained], activityIds);
-        const freshAttention = await this.findFreshAttention(unread, previousItems, statuses, identity.login);
+        run.stage = "statuses";
+        this.saveRefreshRun(db, run);
+        const statuses = await this.loadStatuses([...received, ...retained], activityIds);
+        run.stage = "archive_attention";
+        this.saveRefreshRun(db, run);
+        const { surfaced: freshAttention, checks } = await this.findFreshAttention(received, previousItems, statuses, identity.login);
         const observedAt = new Date().toISOString();
+        run.stage = "applying";
+        this.saveRefreshRun(db, run);
         return this.transaction(identity, state => {
+            for (const { item, archivedAt, evidence, reason } of checks) {
+                this.logActivity(state, item, {
+                    eventType: "archive_attention_checked", source: "local_rule",
+                    occurredAt: observedAt, observedAt,
+                    summary: reason ? `Archived activity qualified for ${reason.replaceAll("_", " ")}.` :
+                        "No activity qualified to undo this archive.",
+                    details: { refreshId: run.id, archivedAt, ...evidence },
+                });
+            }
             const existing = new Map(state.items.map(item => [item.id, item]));
-            state.items = unread.map(item => {
+            state.items = received.map(item => {
                 const previous = existing.get(item.id);
                 existing.delete(item.id);
                 // New thread activity wakes a snooze; archives only lift for a fresh attention event.
-                const newActivity = previous && (previous.updatedAt !== item.updatedAt || previous.reason !== item.reason);
+                const newActivity = previous && (previous.updatedAt !== item.updatedAt ||
+                    (previous.githubReason ?? previous.reason) !== item.reason);
                 const resumed = freshAttention.get(item.id);
                 const stillFiled = Boolean(previous?.filed) &&
                     !(resumed && (previous.filedAt ?? previous.updatedAt) === resumed.archivedAt);
@@ -414,7 +615,11 @@ export class TriageStore {
                         previous?.recentActivityOccurredAt ?? null,
                 } : {};
                 const current = {
-                    ...item, ...statuses.get(item.id), reason: stillFiled ? item.reason : resumed?.reason ?? item.reason,
+                    ...item, ...statuses.get(item.id),
+                    // Keep a local attention reason when GitHub repeats the same
+                    // notification; a second poll must not undo a resurfacing.
+                    reason: stillFiled ? item.reason : resumed?.reason ??
+                        (previous?.githubReason === item.reason ? previous.reason : item.reason),
                     ...activity,
                     saved: previous?.saved ?? false, note: previous?.note ?? "",
                     snoozedUntil: newActivity ? null : previous?.snoozedUntil ?? null,
@@ -440,14 +645,14 @@ export class TriageStore {
                         summary: `GitHub notification updated (${String(item.reason ?? "unknown").replaceAll("_", " ")}).`,
                     });
                 }
-                if (previous && previous.inUnread !== true) {
+                if (previous && previous.inUnread !== item.inUnread) {
                     this.logActivity(state, current, {
-                        eventKey: `unread:${item.id}:true:${observedAt}`,
+                        eventKey: `unread:${item.id}:${item.inUnread}:${run.id}`,
                         eventType: "unread_status_changed",
                         source: "github_observation",
                         occurredAt: observedAt,
                         observedAt,
-                        summary: "Notification appeared in GitHub's unread inbox.",
+                        summary: `GitHub now reports this notification as ${item.inUnread ? "unread" : "read"}.`,
                     });
                 }
                 const status = statuses.get(item.id)?.status;
@@ -473,7 +678,7 @@ export class TriageStore {
                         summary: latest.recentActivity,
                     });
                 }
-                if (resumed) {
+                if (previous?.filed && !stillFiled) {
                     this.logActivity(state, current, {
                         eventKey: `resurfaced:${item.id}:${item.updatedAt}:${resumed.reason}`,
                         eventType: "automatically_resurfaced",
@@ -481,38 +686,53 @@ export class TriageStore {
                         occurredAt: item.updatedAt,
                         observedAt,
                         summary: `Automatically returned to Needs me after ${resumed.reason.replaceAll("_", " ")}.`,
+                        details: { refreshId: run.id, archivedAt: resumed.archivedAt },
                     });
                 }
+                this.logDecision(state, current, previous, { trigger: "refresh", refreshId: run.id, observedAt });
                 return current;
             });
             for (const item of existing.values()) {
-                const retainedItem = { ...item, ...statuses.get(item.id), inUnread: false };
-                if (item.inUnread !== false) {
+                const retainedItem = {
+                    ...item, ...statuses.get(item.id), inUnread: false,
+                    githubUnread: null, inGithubNotifications: false,
+                };
+                if (item.inGithubNotifications !== false) {
                     this.logActivity(state, retainedItem, {
-                        eventKey: `unread:${item.id}:false:${observedAt}`,
-                        eventType: "unread_status_changed",
+                        eventKey: `missing:${item.id}:${run.id}`,
+                        eventType: "notification_missing",
                         source: "github_observation",
                         occurredAt: observedAt,
                         observedAt,
-                        summary: "No longer present in GitHub's unread inbox; kept in the local inbox.",
+                        summary: "Not returned by GitHub; kept locally. Its current GitHub read state is unknown.",
+                        details: { refreshId: run.id },
                     });
                 }
+                this.logDecision(state, retainedItem, item, { trigger: "refresh", refreshId: run.id, observedAt });
                 state.items.push(retainedItem);
             }
             state.login = identity.login;
-            state.unreadCount = unread.length;
-            state.lastRefresh = new Date().toISOString();
+            state.unreadCount = run.unreadCount;
+            state.lastRefresh = observedAt;
+            run.status = "succeeded";
+            run.stage = "complete";
+            run.completedAt = observedAt;
+            this.saveRefreshRun(db, run);
         });
     }
 
     async findFreshAttention(items, previousItems, statuses, login) {
         const candidates = [];
         const surfaced = new Map();
+        const checks = [];
         for (const item of items) {
             const previous = previousItems.get(item.id);
             if (!previous?.filed) continue;
             const archivedAt = previous.filedAt ?? previous.updatedAt;
-            if (Date.parse(item.updatedAt) <= Date.parse(archivedAt)) continue;
+            if (Date.parse(item.updatedAt) <= Date.parse(archivedAt)) {
+                checks.push({ item, archivedAt, reason: null, evidence: { rule: "update_not_newer_than_archive", updatedAt: item.updatedAt } });
+                continue;
+            }
             if (previous.reason !== item.reason && needsAttention(item.reason) && !["Issue", "PullRequest"].includes(item.type)) {
                 surfaced.set(item.id, { archivedAt, reason: item.reason });
             } else {
@@ -526,24 +746,27 @@ export class TriageStore {
         const worker = async () => {
             while (next < candidates.length) {
                 const candidate = candidates[next++];
-                const reason = await this.attentionAfterArchive(candidate, login);
+                const { reason, evidence } = await this.attentionAfterArchive(candidate, login);
+                checks.push({ ...candidate, reason, evidence });
                 if (reason) surfaced.set(candidate.item.id, { archivedAt: candidate.archivedAt, reason });
             }
         };
         await Promise.all(Array.from({ length: Math.min(5, candidates.length) }, worker));
-        return surfaced;
+        return { surfaced, checks };
     }
 
     async attentionAfterArchive({ item, archivedAt, authorLogin }, login) {
         const match = /^https:\/\/github\.com\/[^/]+\/[^/]+\/(?:pull|issues)\/(\d+)$/.exec(item.url);
-        if (!match) return null;
+        if (!match) return { reason: null, evidence: { rule: "unsupported_timeline" } };
         const pages = await this.client(`repos/${item.repo}/issues/${match[1]}/timeline?per_page=100`, true);
         if (!Array.isArray(pages) || pages.some(page => !Array.isArray(page))) {
             throw new Error("GitHub returned an unexpected timeline format while checking archived activity.");
         }
         const archivedTime = Date.parse(archivedAt);
         const latestNotificationTime = Date.parse(item.updatedAt) + 2 * 60 * 1000;
-        if (!Number.isFinite(archivedTime) || !Number.isFinite(latestNotificationTime)) return null;
+        if (!Number.isFinite(archivedTime) || !Number.isFinite(latestNotificationTime)) {
+            throw new Error("Cannot compare archive and activity timestamps.");
+        }
         const timeline = pages.flat();
         const recent = timeline.filter(event => {
             const at = Date.parse(event.submitted_at ?? event.created_at);
@@ -573,11 +796,21 @@ export class TriageStore {
             if (authorLogin === login) return "author";
             return null;
         };
-        return recent
+        const evaluated = recent
             .map(event => ({ event, at: Date.parse(event.submitted_at ?? event.created_at) }))
             .sort((left, right) => right.at - left.at)
-            .map(({ event }) => reasonFor(event))
-            .find(Boolean) ?? null;
+            .map(({ event }) => ({
+                type: event.event, actor: actorOf(event) ?? null,
+                occurredAt: event.submitted_at ?? event.created_at,
+                reviewState: event.state ?? null,
+                requestedReviewer: event.requested_reviewer?.login ?? null,
+                requestedTeam: event.requested_team?.slug ?? null,
+                reason: reasonFor(event),
+            }));
+        return {
+            reason: evaluated.find(event => event.reason)?.reason ?? null,
+            evidence: { rule: "timeline_after_archive", updatedAt: item.updatedAt, authorLogin: authorLogin ?? null, hasInteracted, events: evaluated },
+        };
     }
 
     async getTeamMemberships(login) {
@@ -768,6 +1001,7 @@ export class TriageStore {
             if (ids.some(id => !state.items.some(item => item.id === id))) throw new Error("A selected notification no longer exists. Refresh the panel.");
             for (const item of state.items) {
                 if (!selected.has(item.id)) continue;
+                const previous = { ...item };
                 if (action === "save") { item.saved = true; item.filed = false; item.filedAt = null; }
                 if (action === "unsave") item.saved = false;
                 if (action === "snooze") item.snoozedUntil = new Date(until).toISOString();
@@ -783,6 +1017,7 @@ export class TriageStore {
                     observedAt: occurredAt,
                     summary: summaries[action],
                 });
+                this.logDecision(state, item, previous, { trigger: action, observedAt: occurredAt });
             }
         });
     }

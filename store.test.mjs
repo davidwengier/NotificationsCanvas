@@ -34,7 +34,7 @@ test("GraphQL transport preserves command failures when the process rejects its 
 });
 
 const notification = (id, reason = "subscribed", updated = "2026-10-13T10:00:00Z") => ({
-    id, reason, updated_at: updated,
+    id, reason, updated_at: updated, unread: true,
     repository: { full_name: "dotnet/roslyn", html_url: "https://github.com/dotnet/roslyn" },
     subject: { title: `Thread ${id}`, type: "PullRequest", url: `https://api.github.com/repos/dotnet/roslyn/pulls/${id}` },
 });
@@ -57,7 +57,10 @@ async function fixture(t) {
     });
     const data = { pages: [[notification("1", "review_requested")], [notification("2")]], timeline: [[]], statuses: {}, activity: {}, teams: [], graphqlError: null, user: { id: 123, login: "example" } };
     const client = async (endpoint, paginate) => {
-        if (endpoint === "user") return data.user;
+        if (endpoint === "user") {
+            if (data.accountError) throw data.accountError;
+            return data.user;
+        }
         if (endpoint === "user/teams?per_page=100") {
             assert.equal(paginate, true);
             return [data.teams];
@@ -66,8 +69,9 @@ async function fixture(t) {
             assert.equal(paginate, true);
             return data.timeline;
         }
-        assert.equal(endpoint, "notifications?per_page=100");
+        assert.equal(endpoint, "notifications?all=true&per_page=100");
         assert.equal(paginate, true);
+        if (data.notificationError) throw data.notificationError;
         return data.pages;
     };
     const graphqlCalls = [];
@@ -107,6 +111,153 @@ test("pagination, links and deterministic buckets", async t => {
     assert.equal(bucket(state.items[1]), "following");
     assert.deepEqual(state.items.map(item => item.status), ["open", "open"]);
     assert.equal(graphqlCalls.length, 1);
+});
+
+test("an already-read approval on an authored PR is discovered in Needs me and audited", async t => {
+    const { store, data, createStore, directory, client, graphqlClient } = await fixture(t);
+    data.pages = [[{ ...notification("86072", "author"), unread: false }]];
+    data.statuses["dotnet/roslyn#86072"] = {
+        __typename: "PullRequest", state: "OPEN", isDraft: false, merged: false, author: { login: "example" },
+    };
+    data.activity["dotnet/roslyn#86072"] = {
+        __typename: "PullRequestReview", state: "APPROVED", submittedAt: "2026-10-13T09:59:00Z",
+        author: { login: "reviewer" },
+    };
+    const state = await store.refresh();
+    assert.equal(state.unreadCount, 0);
+    assert.equal(bucket(state.items[0]), "needs");
+    assert.equal(state.items[0].inUnread, false);
+    assert.equal(state.items[0].recentActivity, "Approved by reviewer.");
+    const reopened = createStore(directory, client, graphqlClient);
+    const audit = await reopened.diagnose("dotnet/roslyn", 86072);
+    assert.equal(audit.items[0].classification.bucket, "needs");
+    const receipt = audit.events.find(event => event.eventType === "notification_observed");
+    const decision = audit.events.find(event => event.eventType === "triage_decision");
+    assert.equal(receipt.details.githubUnread, false);
+    assert.equal(decision.details.bucket, "needs");
+    assert.equal(decision.details.rule, "direct_attention");
+    assert.equal(decision.details.inputs.reason, "author");
+    assert.equal(decision.details.inputs.recentActivity, "Approved by reviewer.");
+    assert.equal(decision.details.refreshId, receipt.details.refreshId);
+    assert.equal(audit.recentRefreshes[0].status, "succeeded");
+    assert.equal(audit.recentRefreshes[0].endpoint, "notifications?all=true&per_page=100");
+});
+
+test("notification receipts survive a failed lookup without replacing the inbox", async t => {
+    const { store, data } = await fixture(t);
+    const before = await store.refresh();
+    data.pages = [[{ ...notification("86072", "author"), unread: false }]];
+    data.graphqlError = new Error("GitHub status lookup unavailable");
+    await assert.rejects(store.refresh(), /lookup unavailable/);
+    assert.deepEqual(await store.snapshot(), before);
+    const audit = await store.diagnose("dotnet/roslyn", 86072);
+    assert.equal(audit.items.length, 0);
+    assert.equal(audit.events[0].eventType, "notification_observed");
+    assert.equal(audit.recentRefreshes[0].status, "failed");
+    assert.equal(audit.recentRefreshes[0].stage, "statuses");
+    assert.match(audit.recentRefreshes[0].error, /lookup unavailable/);
+    assert.equal(audit.recentRefreshes[0].id, audit.events[0].details.refreshId);
+});
+
+test("fetch and authentication failures are recorded, including runs returning no notifications", async t => {
+    const { store, data } = await fixture(t);
+    data.pages = [[]];
+    await store.refresh();
+    let audit = await store.diagnose("dotnet/roslyn", 86072);
+    assert.equal(audit.recentRefreshes[0].notificationCount, 0);
+    assert.equal(audit.recentRefreshes[0].status, "succeeded");
+    data.notificationError = new Error("Notifications unavailable");
+    await assert.rejects(store.refresh(), /Notifications unavailable/);
+    audit = await store.diagnose("dotnet/roslyn", 86072);
+    assert.equal(audit.recentRefreshes[0].stage, "notifications");
+    assert.equal(audit.recentRefreshes[0].status, "failed");
+    data.accountError = new Error("Not authenticated");
+    await assert.rejects(store.refresh(), /Not authenticated/);
+    audit = await store.diagnose("dotnet/roslyn", 86072);
+    assert.equal(audit.recentRefreshes[0].stage, "account");
+    assert.equal(audit.recentRefreshes[0].accountId, null);
+});
+
+test("malformed notifications leave rejection evidence without replacing the inbox", async t => {
+    const { store, data } = await fixture(t);
+    const before = await store.refresh();
+    const malformed = notification("86072", "author");
+    delete malformed.unread;
+    data.pages = [[malformed]];
+    await assert.rejects(store.refresh(), /unsupported notification shape/);
+    assert.deepEqual(await store.snapshot(), before);
+    const audit = await store.diagnose("dotnet/roslyn", 86072);
+    assert.equal(audit.events[0].eventType, "notification_rejected");
+    assert.equal(audit.recentRefreshes[0].stage, "normalization");
+    assert.equal(audit.recentRefreshes[0].notificationCount, 1);
+});
+
+test("audit history is paginated, durable and isolated by account", async t => {
+    const { store, data, createStore, directory, client, graphqlClient } = await fixture(t);
+    await store.refresh();
+    await store.transaction(store.identity, state => {
+        for (let index = 0; index < 205; index++) {
+            store.logActivity(state, state.items[0], {
+                eventType: "audit_test", source: "local_rule", summary: `Test observation ${index}.`,
+            });
+        }
+    });
+    const reopened = createStore(directory, client, graphqlClient);
+    const first = await reopened.diagnose("dotnet/roslyn", 1);
+    assert.equal(first.events.length, 200);
+    assert.equal(first.hasMoreEvents, true);
+    const second = await reopened.diagnose("dotnet/roslyn", 1, first.nextBeforeSequence);
+    assert.equal(second.hasMoreEvents, false);
+    assert.ok(second.events.length > 0);
+    assert.ok(second.relatedRefreshes.some(run => run.status === "succeeded"));
+    assert.equal(new Set([...first.events, ...second.events].map(event => event.sequence)).size,
+        first.events.length + second.events.length);
+    data.user = { id: 456, login: "second" };
+    await reopened.refresh();
+    const otherAccount = await reopened.diagnose("dotnet/roslyn", 1);
+    assert.equal(otherAccount.events.some(event => event.eventType === "audit_test"), false);
+    assert.ok(otherAccount.recentRefreshes.every(run => run.accountId === 456));
+});
+
+test("the audit schema upgrades a v1 database without changing its inbox", async t => {
+    const { store, createStore, directory, client, graphqlClient } = await fixture(t);
+    const before = await store.refresh();
+    const db = await store.database();
+    db.exec("DROP TABLE refresh_runs; PRAGMA user_version = 1");
+    await store.close();
+    const reopened = createStore(directory, client, graphqlClient);
+    assert.deepEqual(await reopened.snapshot(), before);
+    assert.equal((await reopened.database()).prepare("PRAGMA user_version").get().user_version, 2);
+    await reopened.refresh();
+    assert.equal((await reopened.diagnose("dotnet/roslyn", 1)).recentRefreshes[0].status, "succeeded");
+});
+
+test("read flags cannot undo an archive, but a later approval of an authored PR can", async t => {
+    const { store, data } = await fixture(t);
+    data.pages = [[notification("86072", "author")]];
+    data.statuses["dotnet/roslyn#86072"] = {
+        __typename: "PullRequest", state: "OPEN", isDraft: false, merged: false, author: { login: "example" },
+    };
+    await store.refresh();
+    const archived = await store.change({ ids: ["86072"], action: "file" });
+    const archivedAt = archived.items[0].filedAt;
+    data.pages[0][0].unread = false;
+    assert.equal(bucket((await store.refresh()).items[0]), "filed");
+    const approvedAt = new Date(Date.parse(archivedAt) + 1000).toISOString();
+    data.pages[0][0].updated_at = approvedAt;
+    data.timeline = [[{
+        event: "reviewed", state: "approved", submitted_at: approvedAt, user: { login: "reviewer" },
+    }]];
+    data.activity["dotnet/roslyn#86072"] = {
+        __typename: "PullRequestReview", state: "APPROVED", submittedAt: approvedAt, author: { login: "reviewer" },
+    };
+    assert.equal(bucket((await store.refresh()).items[0]), "needs");
+    const audit = await store.diagnose("dotnet/roslyn", 86072);
+    const archiveCheck = audit.events.find(event => event.eventType === "archive_attention_checked");
+    assert.equal(archiveCheck.details.archivedAt, archivedAt);
+    assert.equal(archiveCheck.details.events[0].reviewState, "approved");
+    assert.equal(archiveCheck.details.events[0].reason, "author");
+    assert.equal(audit.events.find(event => event.eventType === "triage_decision").details.bucket, "needs");
 });
 
 test("review requests on merged or closed PRs are not Needs me, and failed lookups never hide them", async t => {
@@ -238,6 +389,8 @@ test("activity history records timeline, local actions and unread observations w
     await store.refresh();
     await store.change({ ids: ["1"], action: "file" });
     await store.change({ ids: ["1"], action: "note", note: "private note body" });
+    data.pages[0][0].unread = false;
+    await store.refresh();
     data.pages = [[]];
     await store.refresh();
 
@@ -248,6 +401,7 @@ test("activity history records timeline, local actions and unread observations w
     assert.ok(eventTypes.has("file"));
     assert.ok(eventTypes.has("note"));
     assert.ok(eventTypes.has("unread_status_changed"));
+    assert.ok(eventTypes.has("notification_missing"));
     const timeline = events.find(event => event.eventType === "github_timeline_activity");
     assert.equal(timeline.occurredAt, "2026-10-15T09:59:00Z");
     assert.ok(timeline.observedAt);
@@ -446,6 +600,8 @@ test("a new PR comment revives an archive only after the user has participated",
     assert.equal(item.filed, false);
     assert.equal(item.reason, "author");
     assert.equal(bucket(item), "needs");
+    state = await store.refresh();
+    assert.equal(bucket(state.items.find(candidate => candidate.id === "2")), "needs");
 });
 
 test("snoozed follow-up returns at its exact deadline", async t => {

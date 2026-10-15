@@ -16,7 +16,7 @@ await joinSession({
         actions: [
             {
                 name: "refresh",
-                description: "Fetch unread notifications and issue/PR statuses without changing anything on GitHub.",
+                description: "Fetch read and unread notifications, audit decisions, and refresh issue/PR statuses without changing GitHub.",
                 handler: async () => {
                     const state = await store.refresh();
                     return { login: state.login, unread: state.unreadCount, lastRefresh: state.lastRefresh };
@@ -26,6 +26,18 @@ await joinSession({
                 name: "snapshot",
                 description: "Read the locally cached triage state, including saved follow-ups.",
                 handler: () => store.snapshot(),
+            },
+            {
+                name: "diagnose",
+                description: "Explain an issue or PR's notification receipts, bucket decisions and recent refresh successes, failures or gaps.",
+                inputSchema: {
+                    type: "object", required: ["repo", "number"], additionalProperties: false,
+                    properties: {
+                        repo: { type: "string" }, number: { type: "integer", minimum: 1 },
+                        beforeSequence: { type: "integer", minimum: 1 },
+                    },
+                },
+                handler: ctx => store.diagnose(ctx.input.repo, ctx.input.number, ctx.input.beforeSequence),
             },
         ],
         open: async (ctx) => {

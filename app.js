@@ -210,7 +210,9 @@ function card(item) {
     article.append(link, historyButton);
     const reason = (item.reason || "unknown").replaceAll("_", " ");
     const repository = $("group-by-repo").checked ? "" : `${item.repo} · `;
-    const metadata = `${repository}${item.type} · ${reason} · updated ${new Date(item.updatedAt).toLocaleString()}${item.inUnread ? "" : " · no longer in unread inbox"}${item.snoozedUntil ? ` · snoozed until ${new Date(item.snoozedUntil).toLocaleString()}` : ""}`;
+    const readState = item.inGithubNotifications === false ? " · not returned by GitHub; kept locally" :
+        item.inUnread ? "" : " · read on GitHub";
+    const metadata = `${repository}${item.type} · ${reason} · updated ${new Date(item.updatedAt).toLocaleString()}${readState}${item.snoozedUntil ? ` · snoozed until ${new Date(item.snoozedUntil).toLocaleString()}` : ""}`;
     article.append(element("p", metadata, "meta"));
     if (active === "needs") {
         const why = element("p", reasons[item.reason] || `GitHub marked it as ${reason}.`, "why");
@@ -284,7 +286,7 @@ function render() {
     $("refresh").textContent = busy ? "Working..." : "Refresh GitHub";
     $("status").textContent = state.lastRefresh
         ? `${state.login} · ${state.unreadCount} unread on GitHub at last refresh · ${new Date(state.lastRefresh).toLocaleString()}`
-        : "No snapshot yet. Refresh GitHub to fetch your unread notifications.";
+        : "No snapshot yet. Refresh GitHub to fetch your notifications.";
     $("tabs").replaceChildren();
     for (const [key, name] of Object.entries(names)) {
         const count = state.items.filter(item => bucket(item) === key).length;

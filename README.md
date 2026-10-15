@@ -15,9 +15,11 @@ It contains your inbox, preferences and activity history, not extension source.
 
 ## Behaviour
 
-Refresh retrieves all pages of unread notifications. Once discovered, items
+Refresh retrieves all pages of notifications, including ones GitHub has already
+marked read (`all=true`). A read flag does not decide whether something needs
+attention: an approval on your own open PR still goes into Needs me. Once discovered, items
 stay in this local inbox even after GitHub stops reporting them as unread;
-their unread status is shown on the card and GitHub's unread count is still
+their read status is shown on the card and GitHub's unread count is still
 reported separately. Needs me shows GitHub's
 reason for each notification, not AI analysis. Issues and pull requests show a
 status icon: green for open, purple for completed or merged, red for closed
@@ -48,6 +50,35 @@ The activity history records discovery, GitHub notification and timeline
 summaries, observed unread/status changes, your local triage actions, and
 automatic resurfacing decisions. GitHub event time and the time this panel
 noticed the event are shown separately; comment and review text is never saved.
+
+## Diagnosing missed updates
+
+SQLite also records every refresh attempt: when it started and finished, which
+endpoint it used, page and notification counts, the rules version, and whether
+it succeeded or failed (including the failing stage and error). An unfinished
+attempt stays recorded as running; it may still be working or have been
+interrupted.
+
+Each returned notification gets a receipt before status and timeline lookups.
+Each applied item gets a bucket decision with its inputs, previous bucket,
+archive/snooze state and rule explanation. Local actions get decisions too.
+Archived timeline checks retain event types, actors, review states and times,
+without comment bodies. Read state changes never undo a local archive.
+
+Ask Copilot to use the canvas's `diagnose` action with a repository and issue/PR
+number. It returns receipts, decisions and related refresh attempts even if an
+item could not be imported. Results are paginated using `nextBeforeSequence`.
+The History button shows meaningful changes; repetitive poll receipts and
+unchanged decisions remain available through diagnostics without filling the UI.
+Increment `rulesVersion` in `rules.mjs` when changing classification rules.
+
+This is still polling, not an independent GitHub event stream. The panel checks
+on startup and every ten minutes while visible, not while closed. Logs identify
+refresh gaps and failures, but cannot prove what GitHub never returned or
+reconstruct time before auditing began. The first refresh after this update
+can bring previously read notifications into the local inbox.
+
+## Local state
 
 Follow-up snapshots and notes survive a thread leaving the unread inbox.
 Snoozed threads return when due while the panel is open; a new thread update
