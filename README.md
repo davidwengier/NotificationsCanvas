@@ -73,7 +73,8 @@ unchanged decisions remain available through diagnostics without filling the UI.
 Increment `rulesVersion` in `rules.mjs` when changing classification rules.
 
 This is still polling, not an independent GitHub event stream. The panel checks
-on startup and every ten minutes while visible, not while closed. Logs identify
+on startup and when you press Refresh GitHub, not while closed. The refresh time
+turns red once it is more than ten minutes old. Logs identify
 refresh gaps and failures, but cannot prove what GitHub never returned or
 reconstruct time before auditing began. The first refresh after this update
 can bring previously read notifications into the local inbox.
@@ -83,7 +84,8 @@ can bring previously read notifications into the local inbox.
 Follow-up snapshots and notes survive a thread leaving the unread inbox.
 Snoozed threads return when due while the panel is open; a new thread update
 clears snoozing. New direct attention after an archive is detected on refresh.
-The open panel refreshes when it starts and every ten minutes. New mentions,
+The open panel refreshes when it starts and when you press Refresh GitHub; the
+refresh time turns red after ten minutes. New mentions,
 review requests and other direct notifications appear in Needs me, even for a
 saved follow-up. There are no background alerts. Reading through GitHub itself
 can still affect GitHub's read state.

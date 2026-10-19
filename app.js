@@ -2,6 +2,7 @@
 import { bucket, groupByRepository } from "./rules.mjs";
 const $ = id => document.getElementById(id);
 const names = { needs: "Needs me", following: "Following", followup: "Follow-up", snoozed: "Snoozed", filed: "Archived" };
+const staleAfterMs = 10 * 60 * 1000;
 const reasons = {
     assign: "You were assigned.",
     author: "GitHub marked an update to something you authored.",
@@ -284,8 +285,12 @@ function render() {
     $("group-by-repo").checked = groupingByTab.get(active) ?? true;
     $("refresh").disabled = busy;
     $("refresh").textContent = busy ? "Working..." : "Refresh GitHub";
+    // Nothing refreshes automatically, so make an old snapshot obvious (colour plus text,
+    // so it doesn't rely on colour alone).
+    const stale = !state.lastRefresh || Date.now() - Date.parse(state.lastRefresh) > staleAfterMs;
+    $("status").className = state.lastRefresh && stale ? "stale" : "";
     $("status").textContent = state.lastRefresh
-        ? `${state.login} · ${state.unreadCount} unread on GitHub at last refresh · ${new Date(state.lastRefresh).toLocaleString()}`
+        ? `${state.login} · ${state.unreadCount} unread on GitHub at last refresh · ${new Date(state.lastRefresh).toLocaleString()}${stale ? " · out of date, refresh" : ""}`
         : "No snapshot yet. Refresh GitHub to fetch your notifications.";
     $("tabs").replaceChildren();
     for (const [key, name] of Object.entries(names)) {
@@ -354,14 +359,11 @@ $("file-visible").addEventListener("click", () => {
         perform(() => request("change", { ids, action: "file" }));
     }
 });
-// Re-evaluate snooze deadlines locally; refresh periodically while this panel is open
-// so new GitHub activity is not hidden behind a stale snapshot.
+// No automatic GitHub refresh. Re-render locally so snoozes wake and the
+// last-refresh time turns red once it passes the threshold, even while idle.
 setInterval(() => {
-    if (!busy) {
-        if (document.visibilityState === "visible") perform(() => request("refresh", {}));
-        else render();
-    }
-}, 10 * 60 * 1000);
+    if (!busy) render();
+}, 30 * 1000);
 perform(async () => {
     applySnapshot(await request("state"));
     render();

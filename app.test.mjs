@@ -56,8 +56,14 @@ async function fixture(previousSnapshot) {
         return elements.get(id);
     };
     get("group-by-repo").checked = true;
+    const clock = { now: Date.parse("2026-10-15T12:00:00Z") };
+    const intervals = [];
     const context = createContext({
-        bucket, groupByRepository, setInterval() {},
+        bucket, groupByRepository, setInterval: (callback, ms) => intervals.push({ callback, ms }),
+        Date: class extends Date {
+            constructor(...args) { super(...(args.length ? args : [clock.now])); }
+            static now() { return clock.now; }
+        },
         document: { getElementById: get, createElement: tag => new Element(tag), createElementNS: (_, tag) => new Element(tag) },
         Option: class extends Element {},
         fetch: async (route, options) => {
@@ -95,7 +101,7 @@ async function fixture(previousSnapshot) {
     runInContext(source.replace(/^import .* from "\.\/rules\.mjs";\r?\n/m, ""), context);
     await new Promise(resolve => setImmediate(resolve));
     return {
-        get, hasElement: id => elements.has(id), snapshot, tabs,
+        get, hasElement: id => elements.has(id), snapshot, tabs, clock, intervals,
         select: tab => get("tabs").children.find(button => button.textContent.startsWith(`${tabs[tab]} (`)).fire("click"),
         groups: () => get("items").children.filter(node => node.tag === "details"),
         activityTexts: () => get("items").children.flatMap(group => (group.children ?? [])
@@ -271,4 +277,28 @@ test("archiving and changing the number of Following groups do not override expa
     ui.snapshot.items = ui.snapshot.items.filter(item => item.repo !== "dotnet/razor");
     await ui.refresh();
     assert.deepEqual(ui.groups().map(group => group.open), [false]);
+});
+
+test("the refresh time turns red after ten minutes and the timer never refreshes GitHub", async () => {
+    const ui = await fixture();
+    ui.snapshot.lastRefresh = "2026-10-15T11:50:00Z";
+    await ui.refresh();
+    await ui.settle();
+
+    // Exactly ten minutes old is still fresh.
+    assert.equal(ui.get("status").className, "");
+    assert.doesNotMatch(ui.get("status").textContent, /out of date/);
+
+    ui.clock.now += 1000;
+    const timer = ui.intervals.at(-1);
+    timer.callback();
+    assert.equal(ui.get("status").className, "stale");
+    assert.match(ui.get("status").textContent, /out of date/);
+    assert.ok(timer.ms < 10 * 60 * 1000);
+
+    // Refreshing stores a new time, which clears the warning.
+    ui.snapshot.lastRefresh = new Date(ui.clock.now).toISOString();
+    await ui.refresh();
+    await ui.settle();
+    assert.equal(ui.get("status").className, "");
 });
