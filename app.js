@@ -28,6 +28,29 @@ const groupExpansion = new Map();
 const groupingByTab = new Map();
 let renderedGroups = [];
 let preferenceWrites = Promise.resolve();
+let refreshStartedAt = null;
+let lastRefreshDuration = null;
+let refreshFailed = false;
+
+function formatDuration(milliseconds) {
+    if (milliseconds < 1000) return `${Math.floor(milliseconds)} ms`;
+    if (milliseconds < 60000) return `${(Math.floor(milliseconds / 100) / 10).toFixed(1)} seconds`;
+    const seconds = Math.floor(milliseconds / 1000);
+    const minutes = Math.floor(seconds / 60);
+    return minutes < 60
+        ? `${minutes} min ${seconds % 60} sec`
+        : `${Math.floor(minutes / 60)} hr ${minutes % 60} min ${seconds % 60} sec`;
+}
+
+function renderRefreshStatus() {
+    const status = $("refresh-status");
+    status.hidden = refreshStartedAt === null && lastRefreshDuration === null;
+    status.textContent = refreshStartedAt !== null
+        ? `Refreshing GitHub: ${formatDuration(performance.now() - refreshStartedAt)} elapsed.`
+        : lastRefreshDuration !== null
+            ? `${refreshFailed ? "Last refresh failed after" : "Last refresh took"} ${formatDuration(lastRefreshDuration)}.`
+            : "";
+}
 
 function applySnapshot(next) {
     const accountChanged = state.login !== next.login;
@@ -82,19 +105,35 @@ async function request(route, body) {
     return data;
 }
 
-async function perform(operation) {
+async function perform(operation, { refresh = false } = {}) {
     if (busy) return;
+    let timer;
+    if (refresh) {
+        // Include cached-state loading, the request, and rendering, not just GitHub time.
+        // Use a monotonic clock so system clock changes cannot distort the duration.
+        refreshStartedAt = performance.now();
+        refreshFailed = false;
+        timer = setInterval(renderRefreshStatus, 1000);
+    }
     busy = true;
     $("error").hidden = true;
     render();
     try {
         applySnapshot(await operation());
     } catch (error) {
+        if (refresh) refreshFailed = true;
         $("error").textContent = error.message;
         $("error").hidden = false;
     } finally {
         busy = false;
         render();
+        if (refresh) {
+            // Stop only after the updated cards and enabled controls are back in the DOM.
+            lastRefreshDuration = performance.now() - refreshStartedAt;
+            refreshStartedAt = null;
+            clearInterval(timer);
+            renderRefreshStatus();
+        }
     }
 }
 
@@ -292,6 +331,7 @@ function render() {
     $("status").textContent = state.lastRefresh
         ? `${state.login} · ${state.unreadCount} unread on GitHub at last refresh · ${new Date(state.lastRefresh).toLocaleString()}${stale ? " · out of date, refresh" : ""}`
         : "No snapshot yet. Refresh GitHub to fetch your notifications.";
+    renderRefreshStatus();
     $("tabs").replaceChildren();
     for (const [key, name] of Object.entries(names)) {
         const count = state.items.filter(item => bucket(item) === key).length;
@@ -340,7 +380,7 @@ function render() {
     }
 }
 
-$("refresh").addEventListener("click", () => perform(() => request("refresh", {})));
+$("refresh").addEventListener("click", () => perform(() => request("refresh", {}), { refresh: true }));
 for (const id of ["search"]) $(id).addEventListener("input", () => {
     const saved = savePreference({ filter: id, value: $(id).value });
     render();
@@ -368,4 +408,4 @@ perform(async () => {
     applySnapshot(await request("state"));
     render();
     return request("refresh", {});
-});
+}, { refresh: true });

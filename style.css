@@ -15,7 +15,7 @@ nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 18px 0; }
 #search { flex: 1; min-width: 180px; }
 .filters label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 .toolbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; align-items: center; margin: 18px 0 6px; }
-#explanation, #status, .meta, .empty { color: var(--text-color-muted, #656d76); font-size: 12px; }
+#explanation, #status, #refresh-status, .meta, .empty { color: var(--text-color-muted, #656d76); font-size: 12px; }
 #status.stale { color: var(--true-color-red, #cf222e); font-weight: 600; }
 .why, .activity { margin: 6px 0; font-size: 12px; }
 .activity { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--text-color-muted, #656d76); }

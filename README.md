@@ -91,6 +91,16 @@ saved follow-up. There are no background alerts. Reading through GitHub itself
 can still affect GitHub's read state.
 Subscriptions, read state and GitHub's saved/done states are never changed.
 
+While a refresh runs, the panel shows elapsed time, updated every second.
+Timing starts when you press Refresh GitHub (or the startup refresh begins)
+and ends after the updated inbox is rendered with its controls enabled again.
+It includes loading cached state on startup, GitHub requests, and UI rendering,
+not just the time spent waiting for GitHub. The last duration stays visible until
+the next refresh or the panel is reopened. Failed attempts are labelled as failed,
+with their duration; the error message and stale warning remain separate.
+Durations use milliseconds, seconds, or minutes and hours for longer refreshes,
+and are exposed as accessible status text. This local timer does not poll GitHub.
+
 Data lives in `artifacts\triage.sqlite` beside this file, with separate account
 records. Existing `artifacts\<GitHub numeric account ID>.json` files are imported
 once and left untouched as recovery backups. SQLite is private local data, not

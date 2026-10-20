@@ -29,7 +29,7 @@ class Element {
     fire(name) { return this.listeners.get(name)?.({}); }
 }
 
-async function fixture(previousSnapshot) {
+async function fixture(previousSnapshot, respond) {
     const tabs = {
         needs: "Needs me", following: "Following", followup: "Follow-up",
         snoozed: "Snoozed", filed: "Archived",
@@ -56,17 +56,36 @@ async function fixture(previousSnapshot) {
         return elements.get(id);
     };
     get("group-by-repo").checked = true;
-    const clock = { now: Date.parse("2026-10-15T12:00:00Z") };
+    const clock = { now: Date.parse("2026-10-15T12:00:00Z"), elapsed: 0, renderCost: 0 };
     const intervals = [];
+    const requests = [];
     const context = createContext({
-        bucket, groupByRepository, setInterval: (callback, ms) => intervals.push({ callback, ms }),
+        bucket, groupByRepository,
+        setInterval: (callback, ms) => {
+            const timer = { callback, ms, active: true };
+            intervals.push(timer);
+            return timer;
+        },
+        clearInterval: timer => { timer.active = false; },
+        performance: { now: () => clock.elapsed },
         Date: class extends Date {
             constructor(...args) { super(...(args.length ? args : [clock.now])); }
             static now() { return clock.now; }
         },
-        document: { getElementById: get, createElement: tag => new Element(tag), createElementNS: (_, tag) => new Element(tag) },
+        document: {
+            getElementById: get,
+            createElement: tag => {
+                // Simulate synchronous DOM work so timing tests include the final render.
+                clock.elapsed += clock.renderCost;
+                return new Element(tag);
+            },
+            createElementNS: (_, tag) => new Element(tag),
+        },
         Option: class extends Element {},
         fetch: async (route, options) => {
+            requests.push(route);
+            const response = await respond?.(route, options, clock);
+            if (response) return response;
             if (route === "preferences") {
                 const { tab, grouped, repo, expanded, activeTab, filter, value } = JSON.parse(options.body);
                 snapshot.viewPreferences ??= {};
@@ -101,7 +120,7 @@ async function fixture(previousSnapshot) {
     runInContext(source.replace(/^import .* from "\.\/rules\.mjs";\r?\n/m, ""), context);
     await new Promise(resolve => setImmediate(resolve));
     return {
-        get, hasElement: id => elements.has(id), snapshot, tabs, clock, intervals,
+        get, hasElement: id => elements.has(id), snapshot, tabs, clock, intervals, requests,
         select: tab => get("tabs").children.find(button => button.textContent.startsWith(`${tabs[tab]} (`)).fire("click"),
         groups: () => get("items").children.filter(node => node.tag === "details"),
         activityTexts: () => get("items").children.flatMap(group => (group.children ?? [])
@@ -290,7 +309,7 @@ test("the refresh time turns red after ten minutes and the timer never refreshes
     assert.doesNotMatch(ui.get("status").textContent, /out of date/);
 
     ui.clock.now += 1000;
-    const timer = ui.intervals.at(-1);
+    const timer = ui.intervals.find(timer => timer.ms === 30000);
     timer.callback();
     assert.equal(ui.get("status").className, "stale");
     assert.match(ui.get("status").textContent, /out of date/);
@@ -301,4 +320,101 @@ test("the refresh time turns red after ten minutes and the timer never refreshes
     await ui.refresh();
     await ui.settle();
     assert.equal(ui.get("status").className, "");
+});
+
+test("startup refresh timing includes cached-state loading and stays visible after completion", async () => {
+    let finish;
+    const ui = await fixture(undefined, async (route, _, clock) => {
+        if (route === "state") clock.elapsed += 5000;
+        if (route === "refresh") await new Promise(resolve => { finish = resolve; });
+    });
+    assert.equal(ui.get("refresh-status").hidden, false);
+    assert.equal(ui.get("refresh-status").textContent, "Refreshing GitHub: 5.0 seconds elapsed.");
+    assert.equal(ui.get("refresh").disabled, true);
+    const timer = ui.intervals.find(timer => timer.ms === 1000);
+    ui.clock.elapsed += 12300;
+    timer.callback();
+    assert.equal(ui.get("refresh-status").textContent, "Refreshing GitHub: 17.3 seconds elapsed.");
+    // Wall-clock adjustments must not affect the elapsed duration.
+    ui.clock.now -= 3600000;
+    finish();
+    await ui.settle();
+    assert.equal(ui.get("refresh-status").textContent, "Last refresh took 17.3 seconds.");
+    assert.equal(timer.active, false);
+    assert.equal(ui.get("refresh").disabled, false);
+
+    await ui.select("following");
+    ui.intervals.find(timer => timer.ms === 30000).callback();
+    assert.equal(ui.get("refresh-status").textContent, "Last refresh took 17.3 seconds.");
+    assert.equal(ui.requests.filter(route => route === "refresh").length, 1);
+});
+
+test("manual refresh timing includes the final interactive render and ignores local actions", async () => {
+    let finish;
+    let hold = false;
+    const ui = await fixture(undefined, async route => {
+        if (route === "refresh" && hold) await new Promise(resolve => { finish = resolve; });
+    });
+    ui.snapshot.lastRefresh = "2026-10-15T11:00:00Z";
+    await ui.refresh();
+    hold = true;
+    ui.clock.renderCost = 20;
+    const start = ui.clock.elapsed;
+    const refresh = ui.refresh();
+    await ui.settle();
+    const timer = ui.intervals.filter(timer => timer.ms === 1000).at(-1);
+    ui.clock.elapsed = start + 62000;
+    timer.callback();
+    assert.equal(ui.get("refresh-status").textContent, "Refreshing GitHub: 1 min 2 sec elapsed.");
+    assert.equal(ui.get("status").className, "stale");
+    assert.match(ui.get("status").textContent, /out of date/);
+    await ui.refresh();
+    assert.equal(ui.requests.filter(route => route === "refresh").length, 3);
+
+    // Measure rendering independently of the simulated network wait.
+    finish();
+    await refresh;
+    const total = ui.clock.elapsed - start;
+    assert.ok(total >= 63000, "final DOM rendering must contribute to elapsed time");
+    assert.ok(total < 120000);
+    assert.equal(ui.get("refresh-status").textContent, `Last refresh took 1 min ${Math.floor(total / 1000) % 60} sec.`);
+    assert.equal(timer.active, false);
+    assert.equal(ui.get("refresh").disabled, false);
+    assert.ok(ui.get("tabs").children.every(tab => !tab.disabled));
+    assert.ok(ui.groups().length > 0);
+    assert.equal(ui.get("status").className, "stale");
+
+    const duration = ui.get("refresh-status").textContent;
+    await ui.select("following");
+    const article = ui.groups()[0].children.find(node => node.tag === "article");
+    const actions = article.children.find(node => node.className === "actions");
+    await actions.children.find(button => button.textContent === "Archive").fire("click");
+    assert.equal(ui.get("refresh-status").textContent, duration);
+    assert.equal(ui.requests.filter(route => route === "refresh").length, 3);
+});
+
+test("failed refreshes stop timing, show the error and duration, and allow retry", async () => {
+    let fail = false;
+    const ui = await fixture(undefined, async (route, _, clock) => {
+        if (route !== "refresh") return;
+        clock.elapsed += fail ? 3702000 : 250;
+        if (fail) return { ok: false, json: async () => ({ error: "GitHub is unavailable." }) };
+    });
+    assert.equal(ui.get("refresh-status").textContent, "Last refresh took 250 ms.");
+    fail = true;
+    await ui.refresh();
+    assert.equal(ui.get("refresh-status").textContent, "Last refresh failed after 1 hr 1 min 42 sec.");
+    assert.equal(ui.get("error").textContent, "GitHub is unavailable.");
+    assert.equal(ui.get("error").hidden, false);
+    assert.equal(ui.get("refresh").disabled, false);
+    assert.ok(ui.intervals.filter(timer => timer.ms === 1000).every(timer => !timer.active));
+    fail = false;
+    await ui.refresh();
+    assert.equal(ui.get("refresh-status").textContent, "Last refresh took 250 ms.");
+    assert.equal(ui.get("error").hidden, true);
+});
+
+test("refresh duration status has a polite, atomic accessible announcement", async () => {
+    const html = await readFile(new URL("./index.html", import.meta.url), "utf8");
+    assert.match(html, /<p id="refresh-status" role="status" aria-live="polite" aria-atomic="true" hidden><\/p>/);
 });
